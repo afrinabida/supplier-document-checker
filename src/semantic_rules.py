@@ -7,7 +7,8 @@ from src.decision_engine import decide
 from src.rules_config import CONFIG, RULE_BY_ID
 from src.trusted_facts import fact_at, value_at
 from src.ingestion_models import Completeness
-from src.verification_text import canonical
+from src.verification_text import canonical, quote_spans, evidence_clause_span
+from src.document_sources import get_page_text, SourceLookupError
 from src.verification_conflicts import source_item_code
 import re
 
@@ -26,13 +27,26 @@ def _evidence(facts,paths,filename):
     return list({(e.page_number,e.quote):e for e in values}.values())
 
 
-def _coherent(facts,paths):
+def _coherent(facts,paths,document):
     """Compound interpretations require a shared verified clause, not joined facts."""
     groups=[]
     for path in paths:
         f=fact_at(facts,path)
         if not f or not f.authoritative: return False
-        groups.append({(e.source.page_number,canonical(e.quote)) for e in f.evidence})
+        scopes=set()
+        for e in f.evidence:
+            if e.source.document_id!=document.metadata.document_id: return False
+            try:
+                text=get_page_text(document,e.source.page_number,origin=e.source.text_origin)
+            except SourceLookupError:
+                return False
+            for start,end,_ in quote_spans(text,e.quote,50):
+                span=evidence_clause_span(text,start,end)
+                if span is not None:
+                    scopes.add((e.source.document_id,e.source.page_number,e.source.text_origin,*span))
+        # Repeated fragments cannot select a convenient occurrence or clause.
+        if len(scopes)!=1: return False
+        groups.append(scopes)
     return bool(groups and set.intersection(*groups))
 
 
@@ -43,7 +57,7 @@ def _rule(rule_id,status,explanation,*,evidence=(),actual=None,expected=None):
         actual_value=actual,expected_value=expected,evidence=list(evidence),explanation=explanation)
 
 
-def _record(facts,document,index):
+def _record(facts,document,index=None):
     filename='document.pdf'  # Caller filename is untrusted and unnecessary for policy.
     result=ExtractionResult(document=PDFDocument(filename=filename,pages=[PDFPage(page_number=p.page_number,text=p.text) for p in document.pages]))
     def put(name,paths,value=None):
@@ -68,35 +82,36 @@ def _record(facts,document,index):
         paths=[f'supplier.registrations[{j}].value']
         siblings=[k for k,r in enumerate(facts.supplier.registrations) if r.kind==registration.kind]
         if len(siblings)==1: put(registration.kind.lower(),paths)
-    p=f'line_items[{index}]'
-    for name,leaf in {'item_code':'code','item_description':'description','quantity':'quantity',
-        'unit':'unit','currency':'currency','unit_price':'unit_price','line_total':'line_total'}.items(): put(name,p+'.'+leaf)
-    # Item-specific basis overrides document basis; unknown explicit item tax must
-    # not be erased by a document-level default.
-    tax_facts=[f for f in facts.line_items[index].tax.facts if f.raw_values]
-    if tax_facts or _item_source_tax(document,value_at(facts,p+'.code')):
-        for name in ('vat_treatment','vat_percentage','vat_amount'):
-            result.fields.pop(name,None)
-        put('vat_treatment',p+'.tax.treatment')
-        put('vat_percentage',p+'.tax.rate_percent')
-        put('vat_amount',p+'.tax.amount')
-    # Currency of a price must independently agree with its item currency.
-    for leaf in ('unit_price','line_total'):
-        f=fact_at(facts,p+'.'+leaf)
-        if not f or not f.normalized or f.normalized.currency!=value_at(facts,p+'.currency'):
-            result.fields.pop(leaf,None)
+    if index is not None:
+        p=f'line_items[{index}]'
+        for name,leaf in {'item_code':'code','item_description':'description','quantity':'quantity',
+            'unit':'unit','currency':'currency','unit_price':'unit_price','line_total':'line_total'}.items(): put(name,p+'.'+leaf)
+        # Item-specific basis overrides document basis; unknown explicit item tax must
+        # not be erased by a document-level default.
+        tax_facts=[f for f in facts.line_items[index].tax.facts if f.raw_values]
+        if tax_facts or _item_source_tax(document,value_at(facts,p+'.code')):
+            for name in ('vat_treatment','vat_percentage','vat_amount'):
+                result.fields.pop(name,None)
+            put('vat_treatment',p+'.tax.treatment')
+            put('vat_percentage',p+'.tax.rate_percent')
+            put('vat_amount',p+'.tax.amount')
+        # Currency of a price must independently agree with its item currency.
+        for leaf in ('unit_price','line_total'):
+            f=fact_at(facts,p+'.'+leaf)
+            if not f or not f.normalized or f.normalized.currency!=value_at(facts,p+'.currency'):
+                result.fields.pop(leaf,None)
     duration=fact_at(facts,'delivery.duration')
-    if _coherent(facts,['delivery.duration','delivery.anchor']) and duration.normalized.unit=='day':
+    if _coherent(facts,['delivery.duration','delivery.anchor'],document) and duration.normalized.unit=='day':
         put('delivery_period',['delivery.duration','delivery.anchor'],dict(days=str(duration.normalized.decimal_value),anchor=value_at(facts,'delivery.anchor')))
     put('delivery_date','delivery.calendar_date')
     advances=[];timings=[]
     for j,group in enumerate(facts.payments):
         prefix=f'payments[{j}]'
-        if _coherent(facts,[prefix+'.kind',prefix+'.percent']) and value_at(facts,prefix+'.kind')=='advance':
+        if _coherent(facts,[prefix+'.kind',prefix+'.percent'],document) and value_at(facts,prefix+'.kind')=='advance':
             percentage=value_at(facts,prefix+'.percent')
             if percentage is not None and percentage>=0: advances.append((percentage,prefix))
         duration=fact_at(facts,prefix+'.timing.duration')
-        if (_coherent(facts,[prefix+'.timing.duration',prefix+'.timing.anchor',prefix+'.wording'])
+        if (_coherent(facts,[prefix+'.timing.duration',prefix+'.timing.anchor',prefix+'.wording'],document)
                 and duration.normalized.unit=='day'):
             timings.append((duration,prefix))
     # A standalone verified violation survives other unknown obligations. Multiple
@@ -112,21 +127,21 @@ def _record(facts,document,index):
     # Multiple clauses, caps, or conditions are never collapsed into a policy pass.
     if len(facts.penalties)==1:
         prefix='penalties[0]'
-        if _coherent(facts,[prefix+'.wording',prefix+'.polarity']):
+        if _coherent(facts,[prefix+'.wording',prefix+'.polarity'],document):
             polarity=value_at(facts,prefix+'.polarity')
             if polarity in ('operative','negated'):
                 put('late_penalty_presence',[prefix+'.wording',prefix+'.polarity'],polarity=='operative')
                 put('late_penalty_clause',prefix+'.wording')
             if polarity=='operative':
                 put('late_penalty_percentage',prefix+'.rate_percent')
-                if _coherent(facts,[prefix+'.rate_percent',prefix+'.basis',prefix+'.period']):
+                if _coherent(facts,[prefix+'.rate_percent',prefix+'.basis',prefix+'.period'],document):
                     put('late_penalty_basis',[prefix+'.basis',prefix+'.period'],
                         dict(basis=value_at(facts,prefix+'.basis'),period=value_at(facts,prefix+'.period')))
                 put('late_penalty_cap',prefix+'.cap_percent')
     return result
 
 
-def _arithmetic(facts,matching):
+def _arithmetic(facts,matching,document):
     """Exact Decimal relational checks; the existing money presentation policy."""
     results=[];lines=[];currencies=[]
     def check(suffix,actual,expected,paths):
@@ -143,7 +158,7 @@ def _arithmetic(facts,matching):
             pf,tf=(fact_at(facts,p+'.'+leaf) for leaf in ('unit_price','line_total'))
             compatible=bool(currency=='BDT' and pf and pf.normalized and tf and tf.normalized and
                 pf.normalized.currency==tf.normalized.currency==currency and
-                _coherent(facts,[p+'.quantity',p+'.unit_price',p+'.line_total']))
+                _coherent(facts,[p+'.quantity',p+'.unit_price',p+'.line_total'],document))
             check('line_'+str(i),total if compatible else None,q*price if compatible and q is not None and price is not None else None,
                 [p+'.quantity',p+'.unit_price',p+'.line_total'])
             lines.append(total)
@@ -165,7 +180,7 @@ def _arithmetic(facts,matching):
 
 def evaluate_trusted_rules(facts,document,purchase_request,matching):
     """Run all checks without aggregation, for explicit orchestration stages."""
-    arithmetic=_arithmetic(facts,matching)
+    arithmetic=_arithmetic(facts,matching,document)
     evaluations=[];checks=[]
     for match in matching.items:
         record=_record(facts,document,match.supplier_index)
@@ -179,9 +194,9 @@ def evaluate_trusted_rules(facts,document,purchase_request,matching):
             infer_layout_absence=False)
         evaluations.append(evaluation);checks.extend(evaluation.results)
     if not evaluations:
-        # Run every required rule even when the provider supplied no items.
-        empty=ExtractionResult(document=PDFDocument(filename='document.pdf',pages=[]))
-        evaluation=evaluate_rules(empty,purchase_request,arithmetic_results=arithmetic,
+        # Retain verified document facts even when no item claims were extracted.
+        record=_record(facts,document)
+        evaluation=evaluate_rules(record,purchase_request,arithmetic_results=arithmetic,
             match_result=(None,'No verified items.'),infer_layout_absence=False)
         checks.extend(evaluation.results)
     uncertainties=[]

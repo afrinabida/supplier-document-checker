@@ -9,7 +9,7 @@ from src.semantic_extraction import _unique_object, _structural_claim_check, _cl
 from src.local_validation import validation_boundary, fail
 
 VERSION='minimal-native-json-v1'
-PROMPT_VERSION='minimal-native-json-v1-registration-claims-v1'
+PROMPT_VERSION='minimal-native-json-v1-scoped-evidence-v3'
 METADATA=frozenset(('schema_version','document_id','ingestion_completeness','interpretation_method'))
 
 REGISTRATION_OUTPUT_INSTRUCTIONS=(
@@ -21,6 +21,31 @@ REGISTRATION_OUTPUT_INSTRUCTIONS=(
     'zeros as strings inside v. Missing information is null. For ambiguity or conflict retain supported '
     'candidates and evidence using the existing s and r fields; never select a convenient value. '
     'Do not infer owner_role: leave it null unless explicitly supported by source wording.')
+
+CONTAINER_OUTPUT_INSTRUCTIONS=(
+    'The json_schema is the authoritative response contract; resolve its $defs/$ref definitions. '
+    'Return only the listed properties at every level, with no extra fields or explanatory wrapper. '
+    'Missing observations use null claim leaves, not null containers. Other nullable properties '
+    'follow json_schema. Container objects must remain objects, even when all their '
+    'claims are missing: line_items[*].tax is {"treatment":null,"rate_percent":null,"amount":null}, '
+    'not null or a string; payments[*].timing is {"wording":null,"calendar_date":null,'
+    '"duration":null,"duration_unit":null,"anchor":null}, not null or a string. '
+    'Apply this object rule to supplier, delivery, tax, amounts and validity as well. '
+    'Use [] for collections with no extracted entries. Optional properties may be omitted only '
+    'where the schema permits; never replace a required container with null. '
+    'Template objects contain no observed facts and must not be copied as source evidence. '
+    'Keep line-item identity item_id separate from the observed code claim; missing code is null. '
+    'Do not infer VAT treatment or any missing source value.')
+
+SCOPED_EVIDENCE_INSTRUCTIONS=(
+    'Each q must be an exact, minimal source clause or labelled item row that proves the field role '
+    'as well as the value. Do not quote a full page or an isolated repeated number/unit. '
+    'For delivery duration, unit and anchor, quote the same complete delivery clause. '
+    'For advance kind and percentage, quote the same explicit payment obligation. '
+    'For PR references include the source label, including its newline when printed above the value. '
+    'Extract every explicitly stated line-item code into code, separately from item_id; include '
+    'the exact item label and row context in its evidence. If a table cannot be bound '
+    'unambiguously to an item, leave the claim missing or unresolved; never reconstruct a row or invent a code.')
 
 
 class StrictResponse(BaseModel):
@@ -178,6 +203,7 @@ def proposal(document):
         return 'string'
     context=json.loads(_claims_context(document))
     context['response_contract']=dict(version=VERSION,shape=shape(SemanticDocument),
+        json_schema=response_model().model_json_schema(),
         metadata=dict(schema_version='1.0',document_id=document.metadata.document_id,
             ingestion_completeness=document.completeness.value,interpretation_method='FUTURE_PROVIDER'),
         claim=dict(v=['exact raw value'],e=[dict(p=1,q='exact contiguous page quote')]),
@@ -188,7 +214,7 @@ def proposal(document):
             'empty arrays mean no extracted entries, never proof of absence. Keep all candidates and quotes. Use unresolved '
             'states plus reason for ambiguity, conflict or unsupported interpretations. Never choose a convenient candidate. '
             'All numeric observations are exact strings. Never emit normalized values, verification authority or decisions. '
-            +REGISTRATION_OUTPUT_INSTRUCTIONS)
+            +REGISTRATION_OUTPUT_INSTRUCTIONS+' '+CONTAINER_OUTPUT_INSTRUCTIONS+' '+SCOPED_EVIDENCE_INSTRUCTIONS)
     return dict(version=VERSION,prompt_version=PROMPT_VERSION,live_enabled=False,provider_acceptance='UNVERIFIED',
         generation_config=dict(response_mime_type='application/json',temperature=0,max_output_tokens=16384,
             automatic_function_calling=dict(disable=True)),

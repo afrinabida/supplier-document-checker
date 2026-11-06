@@ -89,8 +89,6 @@ def show_graph_review(state):
         from src.evaluation_store import original_pdf
         try:
             data = original_pdf(state)
-            from ui.private_fixtures import require_public_document
-            require_public_document(data, state['input_filename'])
             st.download_button('Download assessed source PDF', data, file_name=state['input_filename'],
                                mime='application/pdf', key='source-pdf-'+state['thread_id'])
             if st.checkbox('Show original pages', key='source-preview-'+state['thread_id']):
@@ -175,19 +173,13 @@ def render() -> None:
     from ui.components import page_header
     from ui.ai_processing import GeminiConfig, render_configuration, render_run
     from ui.upload_state import active_pending_documents
-    from ui.evaluation_workflow import start_evaluation, STEP_LABELS
+    from ui.evaluation_workflow import STEP_LABELS
+    from ui.batch_evaluation import prepare_batch, run_batch, summary_rows
     page_header('Document processing', 'Start one fixed-step evaluation: extract, verify evidence, compare the purchase request, check rules and retain the decision for review.')
     restore_graph_runs()
     # Discard legacy quick-run flags: navigation/reruns never authorize processing.
     st.session_state.pop('process_queued_documents', None)
     pending = active_pending_documents(st.session_state)
-    from ui.private_fixtures import require_single_manual_document
-    manual_batch_valid = True
-    try:
-        require_single_manual_document(pending)
-    except ValueError:
-        manual_batch_valid = False
-        st.error('Manual evaluation accepts exactly one individually uploaded PDF at a time.')
     st.subheader('Selected supplier documents')
     if pending:
         st.dataframe([{'Filename': name, 'Size (KB)': round(len(data)/1024, 1)} for name, data in pending],
@@ -219,7 +211,7 @@ def render() -> None:
         st.error('Evaluation configuration is invalid. No processing or automatic fallback will run.')
     render_configuration()
     st.caption('LangGraph runs fixed steps and saves resumable checkpoints automatically. Existing history is preserved. Backend configuration is managed by the operator; there is no processing-mode menu.')
-    clicked = st.button('Start Evaluation', disabled=not pending or not ready or not manual_batch_valid, type='primary')
+    clicked = st.button('Start Evaluation', disabled=not pending or not ready, type='primary')
     if clicked and config is not None:
         batch = st.query_params.get('evaluation_batch') or st.session_state.get('evaluation_batch') or uuid4().hex
         st.session_state['evaluation_batch'] = batch
@@ -232,47 +224,45 @@ def render() -> None:
         else:
             st.session_state.pop('ai_thread_ids', None)
             st.query_params.pop('ai_workflow', None)
-        progress, status = st.progress(0), st.empty()
-        errors, results, decisions, states, threads = [], [], {}, {}, []
-        ai_threads = list(st.session_state.get('ai_thread_ids', []))
-        for index, (name, data) in enumerate(pending):
-            def update(stage):
-                status.write(name + ': ' + STEP_LABELS.get(stage, stage.replace('_', ' ').title()))
-                fraction = {'validate_pdf':0.02,'ingest':0.10,'extract':0.25,'validate':0.40,
-                    'verify':0.40,'trust':0.50,'match_pr':0.60,'arithmetic':0.70,
-                    'rules':0.80,'decide':0.90,'human_review':0.95,'finalize':1.0}.get(stage,0)
-                progress.progress((index + fraction)/len(pending))
-            try:
-                mode, state = start_evaluation(name, data, config=config, batch=batch,
-                    cloud_processing_authorized=consent, fresh=fresh, on_stage=update)
-                if mode == 'AI-assisted':
-                    if state['thread_id'] not in ai_threads:
-                        ai_threads.append(state['thread_id'])
-                    st.session_state['ai_thread_ids'] = ai_threads
-                    st.query_params['ai_workflow'] = ai_threads
-                    if state.get('safe_error'):
-                        st.error(name + ': Technical Processing Failed ('+state['safe_error']['code']+'). Inspect the saved safe diagnostic below; no supplier success or fallback was recorded.')
-                    else:
-                        from src.execution_status import presentation_outcome, HUMAN_REVIEW
-                        outcome=presentation_outcome(state)
-                        if outcome['status']==HUMAN_REVIEW:
-                            st.warning(name + ': Human Review Required. The automated assessment is saved; the workflow is awaiting review, not finalized.')
-                        elif outcome['business_decision']:
-                            st.success(name + ': '+outcome['business_decision']+'. Inspect the saved assessment and evidence below.')
-                        else:
-                            st.info(name + ': workflow saved; no completed supplier assessment is available yet.')
-                else:
-                    from src.graph_workflow import automatic_records
-                    threads.append(state['thread_id'])
-                    states[name] = state
-                    extraction, decision = automatic_records(state)
+        batch_state=prepare_batch(st.session_state.get('batch_evaluations'),pending,config,fresh=fresh)
+        st.session_state['batch_evaluations']=batch_state
+        progress, status, live_summary = st.progress(0), st.empty(), st.empty()
+        def update(index,total,row,stage):
+            status.write(row['filename']+': '+STEP_LABELS.get(stage,stage.replace('_',' ').title()))
+            fraction={'validate_pdf':0.02,'ingest':0.10,'extract':0.25,'validate':0.40,
+                'verify':0.40,'trust':0.50,'match_pr':0.60,'arithmetic':0.70,
+                'rules':0.80,'decide':0.90,'human_review':0.95,'finalize':1.0,'saved':1.0}.get(stage,0)
+            progress.progress((index+fraction)/total)
+            live_summary.dataframe(summary_rows(batch_state),hide_index=True,width='stretch')
+        run_batch(batch_state,pending,config=config,cloud_processing_authorized=consent,on_progress=update)
+        errors, results, decisions, states, threads, ai_threads = [], [], {}, {}, [], []
+        for row in batch_state['documents']:
+            name,state=row['filename'],row['state']
+            if row['status']=='Processing Error':
+                errors.append(name+': '+row['reason'])
+            if state is None:
+                continue
+            if row['mode']=='AI-assisted':
+                ai_threads.append(state['thread_id'])
+                if row['status']=='Human Review':
+                    st.warning(name+': Human Review Required. The saved assessment is awaiting review.')
+                elif row['status'] in ('Approve','Reject'):
+                    st.success(name+': '+row['status'])
+            else:
+                from src.graph_workflow import automatic_records
+                threads.append(state['thread_id'])
+                states[name]=state
+                if not state.get('error'):
+                    extraction,decision=automatic_records(state)
                     results.append(extraction)
-                    decisions[name] = decision
-            except (ValueError, OSError, sqlite3.Error) as exc:
-                # AI service errors use safe codes. Local validation errors are shown without payloads.
-                message = str(exc) if not config.enabled else 'AI evaluation could not start safely. No fallback was run.'
-                errors.append(name + ': ' + message)
-            progress.progress((index+1)/len(pending))
+                    decisions[name]=decision
+        if config.enabled:
+            st.session_state['ai_thread_ids']=ai_threads
+            if ai_threads:
+                st.query_params['ai_workflow']=ai_threads
+            else:
+                st.query_params.pop('ai_workflow',None)
+        live_summary.empty()
         st.session_state['evaluation_start_errors'] = errors
         if not config.enabled:
             st.session_state.update(extraction_results=results, extraction_errors=errors,
@@ -282,6 +272,9 @@ def render() -> None:
             else:
                 st.query_params.pop('workflow', None)
         status.write('Evaluation batch finished. Decisions and unresolved reviews remain saved; provider failures are not AI successes.')
+    if st.session_state.get('batch_evaluations'):
+        st.subheader('Batch summary')
+        st.dataframe(summary_rows(st.session_state['batch_evaluations']),hide_index=True,width='stretch')
     for error in st.session_state.get('evaluation_start_errors', []):
         st.error(error)
     for state in st.session_state.get('graph_states', {}).values():

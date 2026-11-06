@@ -1,6 +1,5 @@
 """Single UI evaluation entry, backed by the unchanged fixed LangGraph services."""
 from src.evaluation_store import validate_upload
-from ui.private_fixtures import require_public_document, is_private_document
 
 
 STEP_LABELS = {
@@ -20,21 +19,19 @@ STEP_LABELS = {
 
 
 def start_evaluation(name, data, *, config, batch, cloud_processing_authorized=False,
-                     fresh=False, on_stage=None):
+                     fresh=False, on_stage=None, thread_id=None):
     """No fallback: operator configuration selects a persisted graph before execution."""
     if on_stage:
         on_stage('validate_pdf')
-    require_public_document(data, name, allow_manual=True)
-    if is_private_document(data,name) and not config.enabled:
-        raise ValueError('Manual evaluation requires the AI-assisted workflow; legacy extraction is not permitted.')
     validate_upload(name, data)
     if config.enabled:
         from ui.ai_processing import start_document
         return 'AI-assisted', start_document(data, name, config=config,
-            cloud_processing_authorized=cloud_processing_authorized, fresh=fresh, on_stage=on_stage)
+            cloud_processing_authorized=cloud_processing_authorized, fresh=fresh, on_stage=on_stage,
+            thread_id=thread_id)
     from src.graph_workflow import sqlite_service, store_upload, evaluation_thread_id
     from src.workflow import SAMPLE_DIR
     source = store_upload(data, name)
-    thread = evaluation_thread_id(source, SAMPLE_DIR/'purchase-request.csv', namespace='ui_' + batch)
+    thread = thread_id or evaluation_thread_id(source, SAMPLE_DIR/'purchase-request.csv', namespace='ui_' + batch)
     with sqlite_service() as service:
         return 'Deterministic', service.start(source, thread_id=thread, filename=name, on_stage=on_stage)

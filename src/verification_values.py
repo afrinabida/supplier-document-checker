@@ -68,7 +68,9 @@ def role_dates(text,domain):
 
 def labelled(text,label):
     pattern=LABELS.get(label,label)
-    return [m[1].strip() for m in re.finditer(r'(?i)(?:^|[;|])\s*(?:'+pattern+r')\s*[:=]\s*([^;|]+)',canonical(text))]
+    text='\n'.join(canonical(line) for line in text.splitlines())
+    return [m[1].strip() for m in re.finditer(r'(?i)(?:^|[;|\n])\s*(?:'+pattern+
+        r')(?:[ \t]*[:=][ \t]*|[ \t]*\n[ \t]*)([^;|\n]+)',text)]
 
 
 def registration_label_pattern(kind):
@@ -189,7 +191,8 @@ def _number_support(path,raw,context,code,currency):
 
 def support_value(path,raw,context,*,item_code=None,currency=None,registration_kind=None):
     """Prove a narrow source claim, otherwise return uncertainty, never a guess."""
-    context=canonical(context);value=canonical(raw);leaf=path.rsplit('.',1)[-1]
+    context='\n'.join(canonical(line) for line in context.splitlines())
+    value=canonical(raw);leaf=path.rsplit('.',1)[-1]
     if path.startswith('line_items[') and not _item_matches(context,item_code):
         return Support(False,reason='ITEM_SCOPE_UNPROVEN')
     if path.startswith('delivery.') or '.timing.' in path or path.startswith('validity.') or path=='quotation_date':

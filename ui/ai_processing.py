@@ -46,9 +46,6 @@ def render_run(thread_id):
         from ui.components import badge
         from src.execution_status import presentation_outcome, TECHNICAL_FAILURE
         st.markdown(f"**{state.get('input_filename','document.pdf')} | AI-assisted**")
-        from ui.private_fixtures import is_private_document, manual_evaluation_enabled, PRIVATE_PDF_SHA256
-        if (is_private_document(b'',state.get('input_filename','')) or state.get('document_sha256') in PRIVATE_PDF_SHA256) and not manual_evaluation_enabled():
-            st.warning('Private manual-evaluation details require the local frozen-engine gate.');return
         outcome=presentation_outcome(state,assessment=materials.get('assessment',{}))
         badge(outcome['status'])
         if state.get('human_review_status')=='completed':
@@ -115,14 +112,12 @@ def render_run(thread_id):
         st.error('The saved AI workflow could not be opened or updated safely. Its previous assessment has not been replaced.')
 
 
-def start_document(data, name, *, config, cloud_processing_authorized, fresh=False, on_stage=None):
+def start_document(data, name, *, config, cloud_processing_authorized, fresh=False, on_stage=None, thread_id=None):
     """UI boundary: retain F01 typed rows and existing guarded graph services."""
     from src.minimal_json_adapter import MinimalJsonAdapter
     from src.pdf_ingestion import ingest_pdf
-    from ui.private_fixtures import require_public_document
-    require_public_document(data,name,allow_manual=True)
     rows = purchase_request_items(read_purchase_request())
-    thread = 'minimal_' + uuid4().hex if fresh else evaluation_id(data, rows, filename=name, config=config)
+    thread = thread_id or ('minimal_' + uuid4().hex if fresh else evaluation_id(data, rows, filename=name, config=config))
     adapter = MinimalJsonAdapter(ingest_pdf(data))
     single_attempt = config.model_copy(update={'max_retries': 0})
     with ai_sqlite_service(storage_root(), config=single_attempt, provider=adapter,
@@ -148,8 +143,6 @@ def render_configuration():
             st.write('Credential:', 'Present (hidden)' if secret else 'Not configured')
         except (ValueError,TypeError): st.error('Gemini configuration is invalid. Check documented environment settings; no credential values are displayed.')
         st.info('Provider availability: not verified. Configuration and metadata access do not guarantee generation availability. No live connectivity check is performed.')
-        from ui.private_fixtures import manual_evaluation_enabled
-        st.write('Local frozen-engine manual evaluation:', 'Enabled' if manual_evaluation_enabled() else 'Disabled')
         st.caption('A controlled synthetic live run succeeded with gemini-3.1-flash-lite. This does not guarantee current provider availability or accuracy on other documents. Use run.cmd for secure .env loading; direct Streamlit launch reads process environment only.')
 
 
@@ -159,14 +152,7 @@ def render_source_and_fields(state,materials,thread):
         with ai_sqlite_service(storage_root()) as service:
             data=service.store.get_bytes(state['artifacts']['source'])
         name=state.get('input_filename','document.pdf')
-        from ui.private_fixtures import require_public_document
-        try:
-            require_public_document(data, name)
-        except ValueError as exc:
-            st.info(str(exc))
-            data = None
-        if data is not None:
-            render_pdf_preview(data, name, thread)
+        render_pdf_preview(data, name, thread)
     with st.expander('Field-level evidence verification'):
         fields=materials.get('verification',{}).get('fields',[])
         if not fields: st.info('No evidence-verification result exists for this run. Provider or extraction failure did not create verified facts.')

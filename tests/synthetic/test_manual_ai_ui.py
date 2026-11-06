@@ -1,12 +1,10 @@
 """Real UI/graph integration, synthetic bytes and mocked Gemini transport only."""
-from hashlib import sha256
 from pathlib import Path
 import json
 import pytest
 from pydantic import SecretStr
 from streamlit.testing.v1 import AppTest
 from supplier_cases import supplier_case, mocked_gemini
-from ui import private_fixtures as private
 from ui import ai_processing
 from ui.evaluation_workflow import start_evaluation
 from src.gemini_config import GeminiConfig
@@ -30,13 +28,6 @@ def transport(monkeypatch,payload,status=200):
             super().__init__(document,transport=provider)
     monkeypatch.setattr('src.minimal_json_adapter.MinimalJsonAdapter',Adapter)
     return calls
-
-
-def enable_manual(monkeypatch):
-    from src.ai_graph_workflow import implementation_hash
-    monkeypatch.setenv('SUPPLIER_MANUAL_EVALUATION','true')
-    monkeypatch.setenv('SUPPLIER_LOCAL_ONLY','1')
-    monkeypatch.setenv('SUPPLIER_FROZEN_ENGINE_SHA256',implementation_hash())
 
 
 def run_ui(state):
@@ -105,48 +96,45 @@ def test_positive_ai_ui_decision_with_independent_synthetic_pr(setup_ui,monkeypa
     assert not app.error
 
 
-@pytest.mark.parametrize('gate',['off','no-freeze','wrong-freeze','not-local','frozen'])
-def test_manual_gate_uses_only_synthetic_fingerprints(setup_ui,monkeypatch,gate):
+@pytest.mark.parametrize('filename',['supplier-pack-01.pdf','supplier-pack-10.pdf','renamed.pdf'])
+@pytest.mark.parametrize('fingerprint',[None,'0'*64])
+def test_uploaded_pdf_needs_no_filename_hash_or_freeze_gate(setup_ui,monkeypatch,filename,fingerprint):
     case,config=setup_ui
-    monkeypatch.setattr(private,'PRIVATE_PDF_SHA256',frozenset([sha256(case.pdf).hexdigest()]))
-    if gate!='off':enable_manual(monkeypatch)
-    if gate=='no-freeze':monkeypatch.delenv('SUPPLIER_FROZEN_ENGINE_SHA256')
-    if gate=='wrong-freeze':monkeypatch.setenv('SUPPLIER_FROZEN_ENGINE_SHA256','0'*64)
-    if gate=='not-local':monkeypatch.delenv('SUPPLIER_LOCAL_ONLY')
+    if fingerprint is not None:
+        monkeypatch.setenv('SUPPLIER_FROZEN_ENGINE_SHA256',fingerprint)
     calls=transport(monkeypatch,case.response())
-    if gate!='frozen':
-        with pytest.raises(ValueError,match='private evaluation'):
-            start_evaluation('renamed.pdf',case.pdf,config=config,batch='blocked',cloud_processing_authorized=True)
-        assert calls==[]
-    else:
-        _,state=start_evaluation('renamed.pdf',case.pdf,config=config,batch='manual',cloud_processing_authorized=True)
-        assert len(calls)==1 and state['extraction_status']=='SCHEMA_VALIDATED'
-        # Public byte downloads remain blocked even with manual mode enabled.
-        with pytest.raises(ValueError):private.require_public_document(case.pdf,'renamed.pdf')
+    _,state=start_evaluation(filename,case.pdf,config=config,batch='normal-upload',cloud_processing_authorized=True)
+    assert len(calls)==1 and state['extraction_status']=='SCHEMA_VALIDATED'
+    app=run_ui(state)
+    assert not app.error and app.get('download_button')
 
 
-def test_manual_upload_preview_has_no_download_or_batch(setup_ui,monkeypatch):
-    case,_=setup_ui;enable_manual(monkeypatch)
-    monkeypatch.setattr(private,'PRIVATE_PDF_SHA256',frozenset([sha256(case.pdf).hexdigest()]))
+def test_supplier_pack_uploads_have_normal_preview_and_explicit_queue(setup_ui):
+    case,_=setup_ui
     app=AppTest.from_string('import streamlit as st\nfrom ui.upload import render_documents\nrender_documents(st.session_state["documents"])')
-    app.session_state['documents']=[('manual.pdf',case.pdf)]
+    documents=[('supplier-pack-01.pdf',case.pdf),('supplier-pack-10.pdf',case.pdf)]
+    app.session_state['documents']=documents
     app.run(timeout=30)
-    assert not app.exception and not app.error and not app.get('download_button')
-    app.session_state['documents']=[('manual.pdf',case.pdf),('another.pdf',case.pdf)]
-    app.run()
-    assert app.error and next(b for b in app.button if b.label=='Continue to Processing').disabled
+    assert not app.exception and not app.error and app.get('download_button')
+    assert 'pending_documents' not in app.session_state
+    assert not next(b for b in app.button if b.label=='Continue to Processing').disabled
+    next(b for b in app.button if b.label=='Queue selected documents').click().run()
+    assert app.session_state['pending_documents']==documents
 
 
-def test_processing_screen_blocks_stale_private_batch(setup_ui,monkeypatch):
-    case,_=setup_ui;enable_manual(monkeypatch)
-    monkeypatch.setattr(private,'PRIVATE_PDF_SHA256',frozenset([sha256(case.pdf).hexdigest()]))
+def test_processing_accepts_explicit_supplier_pack_batch_without_auto_start(setup_ui,monkeypatch):
+    case,_=setup_ui
     monkeypatch.setenv('ENABLE_GEMINI_EXTRACTION','true')
     monkeypatch.setenv('GEMINI_API_KEY','synthetic-not-a-key')
+    calls=transport(monkeypatch,case.response())
     app=AppTest.from_string('from ui.processing import render\nrender()')
-    app.session_state['pending_documents']=[('one.pdf',case.pdf),('two.pdf',case.pdf)]
+    app.session_state['pending_documents']=[('supplier-pack-01.pdf',case.pdf),('supplier-pack-10.pdf',case.pdf)]
     app.run(timeout=30)
-    assert not app.exception
+    assert not app.exception and calls==[]
     assert next(b for b in app.button if b.label=='Start Evaluation').disabled
+    app.checkbox(key='ai_cloud_consent').check().run()
+    assert not next(b for b in app.button if b.label=='Start Evaluation').disabled
+    assert calls==[]
 
 
 def test_start_button_runs_ai_only_after_consent(setup_ui,monkeypatch):
@@ -167,11 +155,16 @@ def test_start_button_runs_ai_only_after_consent(setup_ui,monkeypatch):
     assert len(calls)==1  # Inspection/rerun never generates again.
 
 
-def test_manual_evaluation_never_uses_deterministic_route(setup_ui,monkeypatch):
-    case,config=setup_ui;enable_manual(monkeypatch)
-    monkeypatch.setattr(private,'PRIVATE_PDF_SHA256',frozenset([sha256(case.pdf).hexdigest()]))
-    with pytest.raises(ValueError,match='AI-assisted'):
-        start_evaluation('manual.pdf',case.pdf,config=config.model_copy(update={'enabled':False}),batch='no-legacy')
+def test_supplier_pack_upload_uses_configured_deterministic_route(setup_ui,monkeypatch):
+    from src import graph_workflow
+    store_upload=graph_workflow.store_upload
+    # Keep the test filesystem guard intact: only the synthetic stored copy uses
+    # a neutral path; the real UI input and graph filename remain supplier-pack.
+    monkeypatch.setattr(graph_workflow,'store_upload',lambda data,name:store_upload(data,'authored.pdf'))
+    case,config=setup_ui
+    mode,state=start_evaluation('supplier-pack-01.pdf',case.pdf,
+        config=config.model_copy(update={'enabled':False}),batch='normal-local')
+    assert mode=='Deterministic' and state['input_filename']=='supplier-pack-01.pdf'
 
 
 @pytest.mark.parametrize('manual',[False,True])
@@ -203,18 +196,43 @@ def test_manual_launcher_rejects_public_server_override(monkeypatch):
     assert launch_local.main(['--server.address','0.0.0.0'])!=0
 
 
-def test_development_access_guard_still_blocks_after_manual_gate(setup_ui,monkeypatch,tmp_path):
-    enable_manual(monkeypatch)
+def test_development_access_guard_still_blocks_original_paths(tmp_path):
     from src.development_isolation import EvaluationAccessError
     with pytest.raises(EvaluationAccessError):
         (tmp_path/'supplier-pack-01.pdf').read_bytes()
 
 
-def test_no_discovery_or_label_access_in_manual_gate(setup_ui,monkeypatch):
-    enable_manual(monkeypatch)
+def test_upload_does_not_discover_originals_or_load_labels(setup_ui,monkeypatch):
+    case,config=setup_ui
     monkeypatch.setattr(Path,'glob',lambda *a,**k:pytest.fail('No file discovery permitted'))
     monkeypatch.setattr(Path,'rglob',lambda *a,**k:pytest.fail('No file discovery permitted'))
-    assert private.manual_evaluation_enabled()
+    calls=transport(monkeypatch,case.response())
+    _,state=start_evaluation('supplier-pack-01.pdf',case.pdf,config=config,
+        batch='no-discovery',cloud_processing_authorized=True)
+    assert len(calls)==1 and state['extraction_status']=='SCHEMA_VALIDATED'
+
+
+@pytest.mark.parametrize('filename,data',[
+    ('supplier-pack-01.pdf',b''),
+    ('supplier-pack-01.pdf',b'not a PDF'),
+    ('supplier-pack-01.txt',b'%PDF-invalid'),
+    ('../supplier-pack-01.pdf',b'%PDF-invalid'),
+    ('supplier-pack-01.pdf',b'%PDF-invalid'),
+])
+def test_upload_validation_still_rejects_invalid_inputs(setup_ui,monkeypatch,filename,data):
+    _,config=setup_ui
+    calls=transport(monkeypatch,{})
+    with pytest.raises(ValueError):
+        start_evaluation(filename,data,config=config,batch='invalid',cloud_processing_authorized=True)
+    assert calls==[]
+
+
+def test_existing_ingestion_byte_limit_is_preserved(setup_ui):
+    from src.pdf_ingestion import ingest_pdf,IngestionLimits
+    case,_=setup_ui
+    document=ingest_pdf(case.pdf,filename='supplier-pack-01.pdf',
+        limits=IngestionLimits(max_file_bytes=len(case.pdf)-1))
+    assert any(w.code=='FILE_SIZE_LIMIT' for w in document.metadata.diagnostics)
 
 
 def test_diagnostics_do_not_display_arbitrary_error_payloads():

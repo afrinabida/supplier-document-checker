@@ -1,7 +1,5 @@
 """Validate uploaded PDFs, then hand the batch to the real workflow."""
 from collections import Counter
-from ui.private_fixtures import (require_public_document, is_private_document,
-    require_single_manual_document, manual_evaluation_enabled)
 from src.evaluation_store import validate_upload
 from ui.components import page_header, navigate
 from ui.upload_state import ingest_uploads, bind_pending, remove_uploads
@@ -9,9 +7,6 @@ from ui.upload_state import ingest_uploads, bind_pending, remove_uploads
 
 def queue_documents(documents):
     import streamlit as st
-    require_single_manual_document(documents)
-    for name,data in documents:
-        require_public_document(data,name,allow_manual=True)
     st.session_state['pending_documents'] = documents
     bind_pending(st.session_state, documents)
     for key in ('extraction_results','extraction_errors','supplier_decisions','graph_states','graph_thread_ids','selected_thread_id','ai_thread_ids','evaluation_start_errors'):
@@ -23,12 +18,10 @@ def queue_documents(documents):
 def render() -> None:
     import streamlit as st
     page_header('Upload Supplier Documents', 'Upload supplier quotation PDFs, then continue to the fixed-step evaluation workflow.')
-    if manual_evaluation_enabled():
-        st.warning('Local manual evaluation enabled for the frozen engine. Upload one authorized evaluation PDF at a time. No evaluation files or labels are loaded automatically.')
     epoch = st.session_state.get('upload_widget_epoch', 0)
     uploads = st.file_uploader('Supplier quotation PDFs', type=['pdf'], accept_multiple_files=True,
                                key=f'supplier_pdf_chooser_{epoch}',
-                               help='Text-based PDFs are supported. Choose files to add to the active document list below.')
+                               help='Select several PDFs with Ctrl/Shift (Command on macOS), or add files in multiple selections. Text-based PDFs are supported.')
     records = ingest_uploads(st.session_state, uploads)
     st.caption('The chooser adds files to the active list. Use Remove or Clear All below to remove active documents. Remaining files stay in the list when the chooser resets.')
     render_documents([(r['name'], r['data']) for r in records.values()], upload_records=list(records.values()))
@@ -71,18 +64,13 @@ def render_documents(documents, *, upload_records=None, empty_message='Upload at
     import streamlit as st
     validated, previews, errors, statuses = [], {}, [], []
     names = Counter(name for name,_ in documents)
-    manual_batch_invalid = len(documents) != 1 and any(is_private_document(data,name) for name,data in documents)
     for name, data in documents:
         try:
             if names[name] > 1:
                 raise ValueError('Duplicate filenames in one batch. Select each document once or give distinct uploads unique names.')
-            require_public_document(data, name, allow_manual=True)
-            if manual_batch_invalid:
-                raise ValueError('Manual evaluation accepts exactly one individually uploaded PDF at a time.')
             document = validate_upload(name,data)
             validated.append((name,data))
-            if not is_private_document(data,name):
-                previews[name] = document
+            previews[name] = document
             statuses.append('Uploaded - ready')
         except ValueError as exc:
             errors.append(f'{name}: {exc}')
@@ -91,16 +79,20 @@ def render_documents(documents, *, upload_records=None, empty_message='Upload at
         st.error(error)
     if upload_records is not None:
         render_removal_controls(upload_records, statuses)
-    enabled = bool(validated) and not errors
+    # Invalid PDFs are recorded individually by Processing, without blocking
+    # the remaining selected files. Same-name uploads must first be renamed.
+    enabled = bool(documents) and all(count==1 for count in names.values())
+    if errors and enabled:
+        st.caption('Invalid PDFs will be recorded as Processing Error. The remaining selected PDFs can still be evaluated.')
     st.caption('Input checks validate readability, not supplier compliance. Final checks run in the fixed-step LangGraph workflow in Processing.')
     if st.button('Continue to Processing',disabled=not enabled,type='primary'):
-        queue_documents(validated)
+        queue_documents(documents)
         st.session_state.pop('process_queued_documents',None)
         navigate('Processing')
         st.rerun()
     if st.button('Queue selected documents', disabled=not enabled):
-        queue_documents(validated)
-        st.success(f'{len(validated)} document(s) queued. Open Processing to run the workflow.')
+        queue_documents(documents)
+        st.success(f'{len(documents)} document(s) queued. Open Processing to run the workflow.')
     if previews:
         with st.expander('Inspect the original document'):
             chosen = st.selectbox('Preview PDF', list(previews), key='upload_preview_id')

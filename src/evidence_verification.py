@@ -9,7 +9,7 @@ from src.semantic_models import SemanticDocument, SemanticField
 from src.verification_conflicts import detect_source_conflicts
 from src.verification_models import (VerificationOutcome as O, VerificationConfig,
     EvidenceCheck, FieldVerification, ResolvedSpan, CoverageSummary, EvidenceVerificationReport)
-from src.verification_text import quote_spans, enclosing_context, contains_value
+from src.verification_text import quote_spans, enclosing_context, contains_value, canonical
 from src.verification_values import support_value, normalize_supported
 
 
@@ -72,6 +72,11 @@ def _check_evidence(document,path,field,evidence,meta,config):
             raise SourceLookupError('Quote limit')
         resolved=resolve_source(document,evidence.source)
         page_text=get_page_text(document,evidence.source.page_number,origin=evidence.source.text_origin)
+        if (len([line for line in page_text.splitlines() if line.strip()])>2
+                and canonical(evidence.quote)==canonical(page_text)):
+            return EvidenceCheck(source=evidence.source,claimed_quote=evidence.quote,
+                quote_outcome=O.VERIFIED,value_outcome=O.UNVERIFIED,
+                normalized_outcome=O.NOT_CHECKABLE,reasons=('FIELD_SCOPED_QUOTE_REQUIRED',)),values
         matches=quote_spans(resolved.text,evidence.quote,config.max_quote_occurrences)
         page_matches=quote_spans(page_text,evidence.quote,config.max_quote_occurrences)
         if not matches or not page_matches:

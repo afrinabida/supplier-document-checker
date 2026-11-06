@@ -41,9 +41,30 @@ def enclosing_context(text,start,end):
     right=text.find('\n',end)
     right=len(text) if right<0 else right
     previous=text[:max(0,left-1)].splitlines()
-    if previous and previous[-1].rstrip().endswith(':'):
+    if previous and (previous[-1].rstrip().endswith(':') or re.fullmatch(
+            r'(?i)(?:purchase reference|pr reference|reference|item(?: code)?|quotation (?:number|no\.?)|quote (?:number|no\.?))',
+            previous[-1].strip())):
         left=max(0,left-1-len(previous[-1]))
-    return canonical(text[left:right])
+    return text[left:right]
+
+
+def evidence_clause_span(text,start,end):
+    """Exact source scope, never join separate sentences to make a compound fact."""
+    left=text.rfind('\n',0,start)+1
+    right=text.find('\n',end)
+    right=len(text) if right<0 else right
+    # A section number and a short field label introduce the following clause;
+    # their periods do not split its evidence. Never skip an operative sentence.
+    prefix=re.match(r'[ \t]*(?:\d+(?:\.\d+)*[.)][ \t]+)?'
+        r'(?:(?:delivery|advance(?:[ \t]+payment)?|payment(?:[ \t]+terms)?|validity|penalty|penalties)'
+        r'[.:][ \t]+)?',text[left:right],re.I)
+    prefix_end=left+prefix.end()
+    boundaries=[left,*[left+m.end() for m in re.finditer(r'(?<=[.!?])\s+',text[left:right])
+        if left+m.end()>prefix_end],right]
+    for a,b in zip(boundaries,boundaries[1:]):
+        if a<=start and end<=b:
+            return a,b
+    return None
 
 
 def contains_value(text,value):
