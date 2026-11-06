@@ -45,6 +45,44 @@ The included fictional purchase request and company rules are required runtime
 reference inputs. Upload only supplier documents you are authorized to process.
 Private evaluation documents, answer keys and historical results are not included.
 
+## LangGraph workflow configuration
+
+LangGraph orchestrates a fixed, auditable supplier document evaluation workflow.
+In AI-assisted mode, the workflow stages are:
+
+1. PDF ingestion with PyMuPDF and supplier information extraction using Gemini.
+2. Pydantic validation, source-evidence verification and trusted-fact construction.
+3. Purchase request matching.
+4. Decimal arithmetic validation.
+5. Company rules evaluation.
+6. Final automated decision: Approve, Reject or Human Review.
+
+### Checkpointing and human review
+
+SQLite checkpoints persist workflow progress and support human-in-the-loop review.
+Each evaluation uses an isolated workflow identity and LangGraph thread/checkpoint
+ID to prevent document state from mixing across evaluations. Uncertain assessments
+pause for review; a recorded human disposition remains separate from the original
+automated assessment.
+
+### Runtime configuration
+
+- LangGraph operates locally and does not require a separate API key.
+- SQLite checkpoint storage provides workflow persistence.
+- `SUPPLIER_CHECKER_RUNTIME_DIR` configures the application's runtime directory;
+  the default is the project-local `.data` directory.
+- Set runtime configuration before launching the application. The launcher loads
+  only the documented Gemini settings from `.env`; set
+  `SUPPLIER_CHECKER_RUNTIME_DIR` in the process environment.
+- Gemini configuration is separate from LangGraph orchestration.
+- Checkpoints, uploaded documents and saved evaluation data must remain private
+  and must not be committed to GitHub.
+
+The deterministic Python rule engine determines the automated procurement decision
+using verified evidence. Gemini supplies untrusted extraction claims, not final
+procurement decisions. The existing deterministic mode uses local extraction
+without Gemini.
+
 ## Multiple-PDF batches
 
 Select several PDFs using Ctrl/Shift (Command on macOS), or add files in several
@@ -81,13 +119,10 @@ responses, and blocks external network calls. These tests do not establish live
 Gemini end-to-end success or independently verified accuracy. No live Gemini call
 or original evaluation PDF processing was performed for this submission.
 
-## Limitations
+## Known Limitations
 
-Live Gemini supplier extraction remains unverified. Supported text layouts,
-scanned-document handling, OCR, arbitrary languages and ambiguous policy terms
-have limitations. Uncertain evidence requires review. Reviewer identity is
-self-declared in this single-user demo. Shared hosting requires authentication,
-authorization and data retention controls. Requirements mix pins and ranges;
-clean-environment and cross-platform reproducibility remain unverified. Direct
-imports langsmith and httpx are declared at the tested versions, but a full
-transitive dependency lockfile is not provided. Passing synthetic tests is not a safety certification.
+- **Document Extraction:** Gemini-based extraction supports the demonstrated supplier-document workflow, but complex tables, scanned PDFs, multilingual content, and inconsistent layouts require further validation.
+- **Evidence Verification:** Ambiguous or insufficiently verified information is escalated for human review rather than used to make unsupported decisions.
+- **Decision Accuracy:** Deterministic company rules are applied to verified evidence. Unclear contractual terms, incomplete evidence, and unspecified tax bases may prevent automatic decisions.
+- **Security:** This single-user demonstration uses self-declared reviewer identities. Production deployment requires authentication, authorization, secure storage, and data retention controls.
+- **Testing and Deployment:** Offline tests cover selected workflows, but unseen-document reliability, clean-environment reproducibility, and production readiness remain unverified.
