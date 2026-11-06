@@ -119,6 +119,21 @@ responses, and blocks external network calls. These tests do not establish live
 Gemini end-to-end success or independently verified accuracy. No live Gemini call
 or original evaluation PDF processing was performed for this submission.
 
+## Offline evaluation results
+
+On 2026-11-06, the complete configured offline synthetic regression suite passed
+in the existing Windows development environment: **194 passed, 0 failed**, with
+**5 dependency deprecation warnings**, in **131.53 seconds**.
+
+Coverage includes supported approval and rejection cases, missing/conflicting
+evidence, human review, Decimal checks, LangGraph checkpoint/interrupt/resume,
+and sequential multi-PDF batches with isolated IDs and per-document failures.
+The runner confirmed that the supplied purchase request and company rules were
+unchanged. Original evaluation PDFs and private labels were excluded; Gemini
+responses were mocked and external network calls blocked. These results do not
+establish live Gemini reliability, unseen-document accuracy or clean-install
+reproducibility.
+
 ## Known Limitations
 
 - **Document Extraction:** Gemini-based extraction supports the demonstrated supplier-document workflow, but complex tables, scanned PDFs, multilingual content, and inconsistent layouts require further validation.
